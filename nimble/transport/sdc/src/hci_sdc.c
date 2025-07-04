@@ -218,24 +218,35 @@ void ble_transport_ll_init(void) {
     return;
   }
 
-  err = sdc_cfg_set(SDC_DEFAULT_RESOURCE_CFG_TAG, SDC_CFG_TYPE_NONE, NULL);
+  err = sdc_rand_source_register(&(sdc_rand_source_t){.rand_poll = rand_poll_});
+  if (err < 0) {
+    return;
+  }
+
+  err = sdc_support_adv();
+  if (err < 0) {
+    return;
+  }
+
+  err = sdc_support_peripheral();
+  if (err < 0) {
+    return;
+  }
+
+  const sdc_cfg_t cfg = {.central_count = {.count = 1}};
+  err = sdc_cfg_set(SDC_DEFAULT_RESOURCE_CFG_TAG, SDC_CFG_TYPE_CENTRAL_COUNT, &cfg);
   if (err < 0) {
     return;
   }
 
   uint8_t *mem = malloc(err);
 
-  err = sdc_rand_source_register(&(sdc_rand_source_t){.rand_poll = rand_poll_});
-  if (err < 0) {
-    return;
-  }
-
   err = sdc_enable(sdc_callback_, mem);
   if (err < 0) {
     return;
   }
 
-  free(mem);
+  // free(mem);
 
   return;
 }
