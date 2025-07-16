@@ -27,6 +27,7 @@
 #include "nimble/nimble_npl.h"
 #include "nimble/nimble_opt.h"
 #include "nimble/transport.h"
+#include "os/os_mbuf.h"
 #include "sdc/mpsl.h"
 #include "sdc/sdc.h"
 #include "sdc/sdc_hci.h"
@@ -36,6 +37,14 @@
 #include "sdc/sdc_hci_cmd_link_control.h"
 #include "sdc/sdc_hci_cmd_status_params.h"
 #include "sdc/sdc_soc.h"
+
+#define BIT(n) (1UL << (n))
+#define BIT_MASK(n) (BIT(n) - 1UL)
+#define BT_ACL_HANDLE_MASK BIT_MASK(12)
+#define bt_acl_handle(h) ((h) & BT_ACL_HANDLE_MASK)
+#define bt_acl_flags(h) ((h) >> 12)
+#define bt_acl_flags_bc(f) ((f) >> 2)
+#define bt_acl_flags_pb(f) ((f) & BIT_MASK(2))
 
 static const uint8_t test_6_pattern[] = {
     /* Random data */
@@ -185,29 +194,57 @@ static void fault_handler_(const char *file, const uint32_t line) {
 }
 
 static void sdc_callback_(void) {
-  uint8_t buf[HCI_MSG_BUFFER_MAX_SIZE];
+  int rc = 0;
+  uint8_t buf[HCI_MSG_BUFFER_MAX_SIZE] = {0};
   uint8_t msg_type;
+  rc = sdc_hci_get(buf, &msg_type);
 
-  (void)sdc_hci_get(buf, &msg_type);
+  struct os_mbuf *m = NULL;
+  m = ble_transport_alloc_acl_from_hs();
+  if (m == NULL) {
+    return;
+  }
+
+  uint16_t hf, handle, len;
+  uint8_t flags, pb, bc;
+
+  uint16_t handle_buf = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+  uint16_t length_buf = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+
+  len = le16toh(length_buf);
+  hf = le16toh(handle_buf);
+  handle = bt_acl_handle(hf);
+  flags = bt_acl_flags(hf);
+  pb = bt_acl_flags_pb(flags);
+  bc = bt_acl_flags_bc(flags);
 
   switch (msg_type) {
-    case SDC_HCI_MSG_TYPE_EVT:
-      ble_transport_to_hs_evt((void *)buf);
+    case SDC_HCI_MSG_TYPE_NONE:
+      // Not sure what to do here
       return;
     case SDC_HCI_MSG_TYPE_DATA:
-      ble_transport_to_hs_acl((void *)buf);
+      rc = os_mbuf_append(m, buf, len + 4);
+      if (rc != 0) {
+        os_mbuf_free_chain(m);
+        return;
+      }
+      ble_transport_to_hs_acl(m);
+      return;
+    case SDC_HCI_MSG_TYPE_EVT:
+      ble_transport_to_hs_evt(m);
+      return;
+    case SDC_HCI_MSG_TYPE_ISO:
+      ble_transport_to_hs_iso(m);
       return;
     default:
       assert(0);
       break;
   }
-
   return;
 }
 
 void ble_transport_ll_init(void) {
   int32_t err;
-
   err = mpsl_init(NULL, 25, fault_handler_);
   if (err < 0) {
     return;
@@ -229,6 +266,11 @@ void ble_transport_ll_init(void) {
   }
 
   err = sdc_support_peripheral();
+  if (err < 0) {
+    return;
+  }
+
+  err = sdc_support_scan();
   if (err < 0) {
     return;
   }
