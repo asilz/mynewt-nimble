@@ -22,6 +22,8 @@
 /* BLE */
 #include <nimble/transport/hci_h4.h>
 
+#include "/home/aszo/Documents/fork/pebble-firmware/src/fw/drivers/uart.h"
+#include "/home/aszo/Documents/fork/pebble-firmware/src/libutil/includes/util/string.h"
 #include "nimble/ble.h"
 #include "nimble/hci_common.h"
 #include "nimble/nimble_npl.h"
@@ -193,49 +195,111 @@ static void fault_handler_(const char *file, const uint32_t line) {
   return;  // TODO: Log error
 }
 
+static size_t data_packet_num = 0;
+
 static void sdc_callback_(void) {
   int rc = 0;
+  int sr;
   uint8_t buf[HCI_MSG_BUFFER_MAX_SIZE] = {0};
   uint8_t msg_type;
   rc = sdc_hci_get(buf, &msg_type);
 
-  struct os_mbuf *m = NULL;
-  m = ble_transport_alloc_acl_from_hs();
-  if (m == NULL) {
-    return;
+  if (rc == 0) {
+    char fmt_buf[16] = {0};
+    uart_write_byte(DBG_UART, '\n');
+    itoa(msg_type, fmt_buf, 16);
+    uart_write_byte(DBG_UART, fmt_buf[8]);
+    uart_write_byte(DBG_UART, fmt_buf[9]);
+    for (size_t i = 0; i < HCI_MSG_BUFFER_MAX_SIZE; ++i) {
+      itoa(buf[i], fmt_buf, 16);
+      uart_write_byte(DBG_UART, fmt_buf[8]);
+      uart_write_byte(DBG_UART, fmt_buf[9]);
+      uart_write_byte(DBG_UART, ' ');
+    }
+    uart_write_byte(DBG_UART, '\n');
   }
 
   uint16_t hf, handle, len;
   uint8_t flags, pb, bc;
 
-  uint16_t handle_buf = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
-  uint16_t length_buf = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+  uint16_t handle_buf = *((uint16_t *)buf);
+  uint16_t length_buf = *((uint16_t *)buf + 1);
 
-  len = le16toh(length_buf);
   hf = le16toh(handle_buf);
   handle = bt_acl_handle(hf);
   flags = bt_acl_flags(hf);
-  pb = bt_acl_flags_pb(flags);
-  bc = bt_acl_flags_bc(flags);
+  pb = bt_acl_flags_pb(flags);  // packet boundary
+  bc = bt_acl_flags_bc(flags);  // broadcast
 
   switch (msg_type) {
     case SDC_HCI_MSG_TYPE_NONE:
-      // Not sure what to do here
+      do {
+        len = buf[1] + 2;
+        struct ble_hci_ev *hci_ev = ble_transport_alloc_evt(0);
+        struct ble_hci_ev_command_complete *cmd_complete = (void *)hci_ev->data;
+        cmd_complete->status = 0;
+        cmd_complete->num_packets = 1;
+        cmd_complete->opcode = BLE_HCI_OPCODE_NOP;
+        hci_ev->opcode = BLE_HCI_EVCODE_COMMAND_COMPLETE;
+        hci_ev->length = sizeof(struct ble_hci_ev_command_complete);
+        if (rc != 0) {
+          ble_transport_free(hci_ev);
+          return;
+        }
+        OS_ENTER_CRITICAL(sr);
+        ble_transport_to_hs_evt(hci_ev);
+        OS_EXIT_CRITICAL(sr);
+        return;
+      } while (0);
       return;
     case SDC_HCI_MSG_TYPE_DATA:
-      rc = os_mbuf_append(m, buf, len + 4);
-      if (rc != 0) {
-        os_mbuf_free_chain(m);
+      do {
+        len = le16toh(length_buf) + 4;
+        struct os_mbuf *m = ble_transport_alloc_acl_from_hs();
+        rc = os_mbuf_append(m, &buf[0], len);
+        if (rc != 0) {
+          os_mbuf_free_chain(m);
+          return;
+        }
+        OS_ENTER_CRITICAL(sr);
+        ble_transport_to_hs_acl(m);
+        OS_EXIT_CRITICAL(sr);
+        ++data_packet_num;
         return;
-      }
-      ble_transport_to_hs_acl(m);
-      return;
+      } while (0);
     case SDC_HCI_MSG_TYPE_EVT:
-      ble_transport_to_hs_evt(m);
-      return;
+      do {
+        len = buf[1] + 2;
+        void *m = ble_transport_alloc_evt(0);
+        memcpy(m, &buf[0], len);
+        if (rc != 0) {
+          ble_transport_free(m);
+          return;
+        }
+        OS_ENTER_CRITICAL(sr);
+        ble_transport_to_hs_evt(m);
+        OS_EXIT_CRITICAL(sr);
+        return;
+      } while (0);
     case SDC_HCI_MSG_TYPE_ISO:
-      ble_transport_to_hs_iso(m);
-      return;
+      do {
+        len = le16toh(length_buf) + 4;
+        for (size_t i = 0; i < len - 1; ++i) {
+          if (buf[i] == 0x3a && buf[i + 1] == 0x2b) {
+            assert(0);
+          }
+        }
+        struct os_mbuf *m = ble_transport_alloc_iso_from_hs();
+        rc = os_mbuf_append(m, &buf[0], len);
+        if (rc != 0) {
+          os_mbuf_free_chain(m);
+          return;
+        }
+        OS_ENTER_CRITICAL(sr);
+        ble_transport_to_hs_iso(m);
+        OS_EXIT_CRITICAL(sr);
+        return;
+      } while (0);
     default:
       assert(0);
       break;
@@ -260,7 +324,7 @@ void ble_transport_ll_init(void) {
     return;
   }
 
-  err = sdc_support_adv();
+  err = sdc_support_ext_adv();
   if (err < 0) {
     return;
   }
@@ -270,13 +334,14 @@ void ble_transport_ll_init(void) {
     return;
   }
 
-  err = sdc_support_scan();
+  sdc_cfg_t cfg = {.peripheral_count = {.count = 1}};
+  err = sdc_cfg_set(SDC_DEFAULT_RESOURCE_CFG_TAG, SDC_CFG_TYPE_PERIPHERAL_COUNT, &cfg);
   if (err < 0) {
     return;
   }
 
-  const sdc_cfg_t cfg = {.central_count = {.count = 1}};
-  err = sdc_cfg_set(SDC_DEFAULT_RESOURCE_CFG_TAG, SDC_CFG_TYPE_CENTRAL_COUNT, &cfg);
+  cfg.adv_count.count = 1;
+  err = sdc_cfg_set(SDC_DEFAULT_RESOURCE_CFG_TAG, SDC_CFG_TYPE_ADV_COUNT, &cfg);
   if (err < 0) {
     return;
   }
@@ -286,6 +351,23 @@ void ble_transport_ll_init(void) {
   err = sdc_enable(sdc_callback_, mem);
   if (err < 0) {
     return;
+  }
+
+  struct ble_hci_ev_command_complete_nop *ev;
+  struct ble_hci_ev *hci_ev;
+
+  hci_ev = ble_transport_alloc_evt(0);
+  if (hci_ev) {
+    /* Create a command complete event with a NO-OP opcode */
+    hci_ev->opcode = BLE_HCI_EVCODE_COMMAND_COMPLETE;
+
+    hci_ev->length = sizeof(*ev);
+    ev = (void *)hci_ev->data;
+
+    ev->num_packets = 1;
+    ev->opcode = BLE_HCI_OPCODE_NOP;
+
+    err = ble_transport_to_hs_evt(hci_ev);
   }
 
   // free(mem);
@@ -328,8 +410,6 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
   uint8_t err = NRF_EOPNOTSUPP;
 
   struct ble_hci_ev *hci_ev = (struct ble_hci_ev *)cmd;
-  hci_ev->opcode = BLE_HCI_EVCODE_COMMAND_COMPLETE;
-  hci_ev->length = sizeof(struct ble_hci_ev_command_complete);
   void *rspbuf = hci_ev->data + sizeof(struct ble_hci_ev_command_complete);
 
   switch (ogf) {
@@ -356,7 +436,7 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
     case 0x03:
       switch (ocf) {
         case BLE_HCI_OCF_CB_SET_EVENT_MASK:
-          err = sdc_hci_cmd_le_set_event_mask(data);
+          err = sdc_hci_cmd_cb_set_event_mask(data);
           break;
 
         case BLE_HCI_OCF_CB_RESET:
@@ -365,7 +445,7 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_CB_READ_TX_PWR:
           err = sdc_hci_cmd_cb_read_transmit_power_level(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_cb_read_transmit_power_level_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_cb_read_transmit_power_level_return_t);
           break;
 
         case BLE_HCI_OCF_CB_SET_CTLR_TO_HOST_FC:
@@ -386,12 +466,12 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_CB_RD_AUTH_PYLD_TMO:
           err = sdc_hci_cmd_cb_read_authenticated_payload_timeout(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_cb_read_authenticated_payload_timeout_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_cb_read_authenticated_payload_timeout_return_t);
           break;
 
         case BLE_HCI_OCF_CB_WR_AUTH_PYLD_TMO:
           err = sdc_hci_cmd_cb_write_authenticated_payload_timeout(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_cb_write_authenticated_payload_timeout_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_cb_write_authenticated_payload_timeout_return_t);
           break;
 
         default:
@@ -404,17 +484,17 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
       switch (ocf) {
         case BLE_HCI_OCF_IP_RD_LOCAL_VER:
           err = sdc_hci_cmd_ip_read_local_version_information(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_ip_read_local_version_information_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_ip_read_local_version_information_return_t);
           break;
 
         case BLE_HCI_OCF_IP_RD_LOC_SUPP_CMD:
           err = sdc_hci_cmd_ip_read_local_supported_commands(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_ip_read_local_supported_commands_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_ip_read_local_supported_commands_return_t);
           break;
 
         case BLE_HCI_OCF_IP_RD_LOC_SUPP_FEAT:
           err = sdc_hci_cmd_ip_read_local_supported_features(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_ip_read_local_supported_features_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_ip_read_local_supported_features_return_t);
           break;
 
         case BLE_HCI_OCF_IP_RD_BUF_SIZE:
@@ -423,7 +503,7 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_IP_RD_BD_ADDR:
           err = sdc_hci_cmd_ip_read_bd_addr(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_ip_read_bd_addr_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_ip_read_bd_addr_return_t);
           break;
 
         default:
@@ -436,7 +516,7 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
       switch (ocf) {
         case BLE_HCI_OCF_RD_RSSI:
           err = sdc_hci_cmd_sp_read_rssi(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_sp_read_rssi_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_sp_read_rssi_return_t);
           break;
 
         default:
@@ -457,17 +537,17 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_RD_BUF_SIZE:
           err = sdc_hci_cmd_le_read_buffer_size(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_read_buffer_size_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_read_buffer_size_return_t);
           break;
 
         case BLE_HCI_OCF_LE_RD_BUF_SIZE_V2:
           err = sdc_hci_cmd_le_read_buffer_size_v2(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_read_buffer_size_v2_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_read_buffer_size_v2_return_t);
           break;
 
         case BLE_HCI_OCF_LE_RD_LOC_SUPP_FEAT:
           err = sdc_hci_cmd_le_read_local_supported_features(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_read_local_supported_features_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_read_local_supported_features_return_t);
           break;
 
         case BLE_HCI_OCF_LE_SET_RAND_ADDR:
@@ -480,7 +560,7 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_RD_ADV_CHAN_TXPWR:
           err = sdc_hci_cmd_le_read_adv_physical_channel_tx_power(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_read_adv_physical_channel_tx_power_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_read_adv_physical_channel_tx_power_return_t);
           break;
 
         case BLE_HCI_OCF_LE_SET_ADV_DATA:
@@ -513,7 +593,7 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_RD_WHITE_LIST_SIZE:
           err = sdc_hci_cmd_le_read_filter_accept_list_size(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_read_filter_accept_list_size_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_read_filter_accept_list_size_return_t);
           break;
 
         case BLE_HCI_OCF_LE_CLEAR_WHITE_LIST:
@@ -538,7 +618,7 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_RD_CHAN_MAP:
           err = sdc_hci_cmd_le_read_channel_map(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_read_channel_map_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_read_channel_map_return_t);
           break;
 
         case BLE_HCI_OCF_LE_RD_REM_FEAT:
@@ -547,12 +627,12 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_ENCRYPT:
           err = sdc_hci_cmd_le_encrypt(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_encrypt_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_encrypt_return_t);
           break;
 
         case BLE_HCI_OCF_LE_RAND:
           err = sdc_hci_cmd_le_rand(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_rand_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_rand_return_t);
           break;
 
         case BLE_HCI_OCF_LE_START_ENCRYPT:
@@ -561,17 +641,17 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_LT_KEY_REQ_REPLY:
           err = sdc_hci_cmd_le_long_term_key_request_reply(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_long_term_key_request_reply_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_long_term_key_request_reply_return_t);
           break;
 
         case BLE_HCI_OCF_LE_LT_KEY_REQ_NEG_REPLY:
           err = sdc_hci_cmd_le_long_term_key_request_negative_reply(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_long_term_key_request_negative_reply_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_long_term_key_request_negative_reply_return_t);
           break;
 
         case BLE_HCI_OCF_LE_RD_SUPP_STATES:
           err = sdc_hci_cmd_le_read_supported_states(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_read_supported_states_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_read_supported_states_return_t);
           break;
 
         case BLE_HCI_OCF_LE_RX_TEST:
@@ -595,12 +675,12 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_SET_DATA_LEN:
           err = sdc_hci_cmd_le_set_data_length(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_set_data_length_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_set_data_length_return_t);
           break;
 
         case BLE_HCI_OCF_LE_RD_SUGG_DEF_DATA_LEN:
           err = sdc_hci_cmd_le_read_suggested_default_data_length(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_read_suggested_default_data_length_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_read_suggested_default_data_length_return_t);
           break;
 
         case BLE_HCI_OCF_LE_WR_SUGG_DEF_DATA_LEN:
@@ -629,7 +709,7 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_RD_RESOLV_LIST_SIZE:
           err = sdc_hci_cmd_le_read_resolving_list_size(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_read_resolving_list_size_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_read_resolving_list_size_return_t);
           break;
 
         case BLE_HCI_OCF_LE_RD_PEER_RESOLV_ADDR:
@@ -650,12 +730,12 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_RD_MAX_DATA_LEN:
           err = sdc_hci_cmd_le_read_max_data_length(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_read_max_data_length_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_read_max_data_length_return_t);
           break;
 
         case BLE_HCI_OCF_LE_RD_PHY:
           err = sdc_hci_cmd_le_read_phy(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_read_phy_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_read_phy_return_t);
           break;
 
         case BLE_HCI_OCF_LE_SET_DEFAULT_PHY:
@@ -680,7 +760,7 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_SET_EXT_ADV_PARAM:
           err = sdc_hci_cmd_le_set_ext_adv_params(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_set_ext_adv_params_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_set_ext_adv_params_return_t);
           break;
 
         case BLE_HCI_OCF_LE_SET_EXT_ADV_DATA:
@@ -697,12 +777,12 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_RD_MAX_ADV_DATA_LEN:
           err = sdc_hci_cmd_le_read_max_adv_data_length(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_read_max_adv_data_length_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_read_max_adv_data_length_return_t);
           break;
 
         case BLE_HCI_OCF_LE_RD_NUM_OF_ADV_SETS:
           err = sdc_hci_cmd_le_read_number_of_supported_adv_sets(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_read_number_of_supported_adv_sets_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_read_number_of_supported_adv_sets_return_t);
           break;
 
         case BLE_HCI_OCF_LE_REMOVE_ADV_SET:
@@ -763,17 +843,17 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_RD_PERIODIC_ADV_LIST_SIZE:
           err = sdc_hci_cmd_le_read_periodic_adv_list_size(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_read_periodic_adv_list_size_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_read_periodic_adv_list_size_return_t);
           break;
 
         case BLE_HCI_OCF_LE_RD_TRANSMIT_POWER:
           err = sdc_hci_cmd_le_read_transmit_power(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_read_transmit_power_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_read_transmit_power_return_t);
           break;
 
         case BLE_HCI_OCF_LE_RD_RF_PATH_COMPENSATION:
           err = sdc_hci_cmd_le_read_rf_path_compensation(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_read_rf_path_compensation_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_read_rf_path_compensation_return_t);
           break;
 
         case BLE_HCI_OCF_LE_WR_RF_PATH_COMPENSATION:
@@ -810,7 +890,7 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_SET_CONN_CTE_TX_PARAMS:
           err = sdc_hci_cmd_le_set_conn_cte_transmit_params(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_set_conn_cte_transmit_params_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_set_conn_cte_transmit_params_return_t);
           break;
 
         case BLE_HCI_OCF_LE_SET_CONN_CTE_REQ_ENABLE:
@@ -819,12 +899,12 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_SET_CONN_CTE_RESP_ENABLE:
           err = sdc_hci_cmd_le_conn_cte_response_enable(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_conn_cte_response_enable_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_conn_cte_response_enable_return_t);
           break;
 
         case BLE_HCI_OCF_LE_RD_ANTENNA_INFO:
           err = sdc_hci_cmd_le_read_antenna_information(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_read_antenna_information_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_read_antenna_information_return_t);
           break;
 
         case BLE_HCI_OCF_LE_PERIODIC_ADV_RECEIVE_ENABLE:
@@ -833,17 +913,17 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_PERIODIC_ADV_SYNC_TRANSFER:
           err = sdc_hci_cmd_le_periodic_adv_sync_transfer(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_periodic_adv_sync_transfer_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_periodic_adv_sync_transfer_return_t);
           break;
 
         case BLE_HCI_OCF_LE_PERIODIC_ADV_SET_INFO_TRANSFER:
           err = sdc_hci_cmd_le_periodic_adv_set_info_transfer(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_periodic_adv_set_info_transfer_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_periodic_adv_set_info_transfer_return_t);
           break;
 
         case BLE_HCI_OCF_LE_PERIODIC_ADV_SYNC_TRANSFER_PARAMS:
           err = sdc_hci_cmd_le_set_periodic_adv_sync_transfer_params(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_set_periodic_adv_sync_transfer_params_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_set_periodic_adv_sync_transfer_params_return_t);
           break;
 
         case BLE_HCI_OCF_LE_SET_DEFAULT_SYNC_TRANSFER_PARAMS:
@@ -860,17 +940,17 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_READ_ISO_TX_SYNC:
           err = sdc_hci_cmd_le_read_iso_tx_sync(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_read_iso_tx_sync_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_read_iso_tx_sync_return_t);
           break;
 
         case BLE_HCI_OCF_LE_SET_CIG_PARAMS:
           err = sdc_hci_cmd_le_set_cig_params(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_set_cig_params_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_set_cig_params_return_t);
           break;
 
         case BLE_HCI_OCF_LE_SET_CIG_PARAMS_TEST:
           err = sdc_hci_cmd_le_set_cig_params_test(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_set_cig_params_test_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_set_cig_params_test_return_t);
           break;
 
         case BLE_HCI_OCF_LE_CREATE_CIS:
@@ -879,7 +959,7 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_REMOVE_CIG:
           err = sdc_hci_cmd_le_remove_cig(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_remove_cig_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_remove_cig_return_t);
           break;
 
         case BLE_HCI_OCF_LE_ACCEPT_CIS_REQ:
@@ -888,7 +968,7 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_REJECT_CIS_REQ:
           err = sdc_hci_cmd_le_reject_cis_request(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_reject_cis_request_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_reject_cis_request_return_t);
           break;
 
         case BLE_HCI_OCF_LE_CREATE_BIG:
@@ -909,7 +989,7 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_BIG_TERMINATE_SYNC:
           err = sdc_hci_cmd_le_big_terminate_sync(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_big_terminate_sync_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_big_terminate_sync_return_t);
           break;
 
         case BLE_HCI_OCF_LE_REQ_PEER_SCA:
@@ -918,32 +998,32 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_SETUP_ISO_DATA_PATH:
           err = sdc_hci_cmd_le_setup_iso_data_path(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_setup_iso_data_path_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_setup_iso_data_path_return_t);
           break;
 
         case BLE_HCI_OCF_LE_REMOVE_ISO_DATA_PATH:
           err = sdc_hci_cmd_le_remove_iso_data_path(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_remove_iso_data_path_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_remove_iso_data_path_return_t);
           break;
 
         case BLE_HCI_OCF_LE_ISO_TRANSMIT_TEST:
           err = sdc_hci_cmd_le_iso_transmit_test(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_iso_transmit_test_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_iso_transmit_test_return_t);
           break;
 
         case BLE_HCI_OCF_LE_ISO_RECEIVE_TEST:
           err = sdc_hci_cmd_le_iso_receive_test(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_iso_receive_test_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_iso_receive_test_return_t);
           break;
 
         case BLE_HCI_OCF_LE_ISO_READ_TEST_COUNTERS:
           err = sdc_hci_cmd_le_iso_read_test_counters(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_iso_read_test_counters_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_iso_read_test_counters_return_t);
           break;
 
         case BLE_HCI_OCF_LE_ISO_TEST_END:
           err = sdc_hci_cmd_le_iso_test_end(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_iso_test_end_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_iso_test_end_return_t);
           break;
 
         case BLE_HCI_OCF_LE_SET_HOST_FEATURE:
@@ -952,12 +1032,12 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_READ_ISO_LINK_QUALITY:
           err = sdc_hci_cmd_le_read_iso_link_quality(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_read_iso_link_quality_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_read_iso_link_quality_return_t);
           break;
 
         case BLE_HCI_OCF_LE_ENH_READ_TRANSMIT_POWER_LEVEL:
           err = sdc_hci_cmd_le_enhanced_read_transmit_power_level(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_enhanced_read_transmit_power_level_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_enhanced_read_transmit_power_level_return_t);
           break;
 
         case BLE_HCI_OCF_LE_READ_REMOTE_TRANSMIT_POWER_LEVEL:
@@ -966,17 +1046,17 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_SET_PATH_LOSS_REPORT_PARAM:
           err = sdc_hci_cmd_le_set_path_loss_reporting_params(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_set_path_loss_reporting_params_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_set_path_loss_reporting_params_return_t);
           break;
 
         case BLE_HCI_OCF_LE_SET_PATH_LOSS_REPORT_ENABLE:
           err = sdc_hci_cmd_le_set_path_loss_reporting_enable(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_set_path_loss_reporting_enable_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_set_path_loss_reporting_enable_return_t);
           break;
 
         case BLE_HCI_OCF_LE_SET_TRANS_PWR_REPORT_ENABLE:
           err = sdc_hci_cmd_le_set_transmit_power_reporting_enable(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_set_transmit_power_reporting_enable_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_set_transmit_power_reporting_enable_return_t);
           break;
 
         case BLE_HCI_OCF_LE_SET_DEFAULT_SUBRATE:
@@ -989,12 +1069,12 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_SET_EXT_ADV_PARAM_V2:
           err = sdc_hci_cmd_le_set_ext_adv_params_v2(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_set_ext_adv_params_v2_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_set_ext_adv_params_v2_return_t);
           break;
 
         case BLE_HCI_OCF_LE_CS_RD_LOC_SUPP_CAP:
           err = sdc_hci_cmd_le_cs_read_local_supported_capabilities(rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_cs_read_local_supported_capabilities_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_cs_read_local_supported_capabilities_return_t);
           break;
 
         case BLE_HCI_OCF_LE_CS_RD_REM_SUPP_CAP:
@@ -1003,7 +1083,7 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_CS_WR_CACHED_REM_SUPP_CAP:
           err = sdc_hci_cmd_le_cs_write_cached_remote_supported_capabilities(data, rspbuf);
-          hci_ev->length +=
+          hci_ev->length =
               sizeof(sdc_hci_cmd_le_cs_write_cached_remote_supported_capabilities_return_t);
           break;
 
@@ -1013,7 +1093,7 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_CS_SET_DEF_SETTINGS:
           err = sdc_hci_cmd_le_cs_set_default_settings(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_cs_set_default_settings_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_cs_set_default_settings_return_t);
           break;
 
         case BLE_HCI_OCF_LE_CS_RD_REM_FAE:
@@ -1022,7 +1102,7 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_CS_WR_CACHED_REM_FAE:
           err = sdc_hci_cmd_le_cs_write_cached_remote_fae_table(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_cs_write_cached_remote_fae_table_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_cs_write_cached_remote_fae_table_return_t);
           break;
 
         case BLE_HCI_OCF_LE_CS_CREATE_CONFIG:
@@ -1039,7 +1119,7 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
         case BLE_HCI_OCF_LE_CS_SET_PROC_PARAMS:
           err = sdc_hci_cmd_le_cs_set_procedure_params(data, rspbuf);
-          hci_ev->length += sizeof(sdc_hci_cmd_le_cs_set_procedure_params_return_t);
+          hci_ev->length = sizeof(sdc_hci_cmd_le_cs_set_procedure_params_return_t);
           break;
 
         case BLE_HCI_OCF_LE_CS_PROC_ENABLE:
@@ -1120,12 +1200,20 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
   }
 
   struct ble_hci_ev_command_complete *cmd_complete = (void *)hci_ev->data;
-  cmd_complete->status = 0;
+  cmd_complete->status = err;
   cmd_complete->num_packets = 1;
   cmd_complete->opcode = htole16(opcode);
+  if (cmd_complete->opcode == BLE_HCI_OPCODE_NOP) {
+    assert(0);
+  }
+  hci_ev->opcode = BLE_HCI_EVCODE_COMMAND_COMPLETE;
+  hci_ev->length += sizeof(struct ble_hci_ev_command_complete);
 
   ble_transport_to_hs_evt(hci_ev);
 
   // ble_transport_free(buf);
+  if (err != 0) {
+    assert(0);
+  }
   return -((int)(err));
 }
