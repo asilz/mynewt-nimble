@@ -205,11 +205,16 @@ static void sdc_callback_(void) {
   rc = sdc_hci_get(buf, &msg_type);
 
   if (rc == 0) {
-    char fmt_buf[16] = {0};
     uart_write_byte(DBG_UART, '\n');
+    const char *msg = "sdc_callback_msg ";
+    for (size_t i = 0; i < sizeof("sdc_callback_msg ") - 1; ++i) {
+      uart_write_byte(DBG_UART, msg[i]);
+    }
+    char fmt_buf[16] = {0};
     itoa(msg_type, fmt_buf, 16);
     uart_write_byte(DBG_UART, fmt_buf[8]);
     uart_write_byte(DBG_UART, fmt_buf[9]);
+    uart_write_byte(DBG_UART, ' ');
     for (size_t i = 0; i < HCI_MSG_BUFFER_MAX_SIZE; ++i) {
       itoa(buf[i], fmt_buf, 16);
       uart_write_byte(DBG_UART, fmt_buf[8]);
@@ -284,11 +289,6 @@ static void sdc_callback_(void) {
     case SDC_HCI_MSG_TYPE_ISO:
       do {
         len = le16toh(length_buf) + 4;
-        for (size_t i = 0; i < len - 1; ++i) {
-          if (buf[i] == 0x3a && buf[i + 1] == 0x2b) {
-            assert(0);
-          }
-        }
         struct os_mbuf *m = ble_transport_alloc_iso_from_hs();
         rc = os_mbuf_append(m, &buf[0], len);
         if (rc != 0) {
@@ -391,6 +391,20 @@ int ble_transport_to_ll_acl_impl(struct os_mbuf *om) {
     i += m->om_len;
   }
 
+  uart_write_byte(DBG_UART, '\n');
+  const char *msg = "acl_msg ";
+  for (size_t i = 0; i < sizeof("acl_msg ") - 1; ++i) {
+    uart_write_byte(DBG_UART, msg[i]);
+  }
+  for (size_t i = 0; i < len; ++i) {
+    char fmt_buf[16];
+    itoa(buf[i], fmt_buf, 16);
+    uart_write_byte(DBG_UART, fmt_buf[8]);
+    uart_write_byte(DBG_UART, fmt_buf[9]);
+    uart_write_byte(DBG_UART, ' ');
+  }
+  uart_write_byte(DBG_UART, '\n');
+
   int32_t err = sdc_hci_data_put(buf);
 
   free(buf);
@@ -411,6 +425,24 @@ int ble_transport_to_ll_cmd_impl(void *buf) {
 
   struct ble_hci_ev *hci_ev = (struct ble_hci_ev *)cmd;
   void *rspbuf = hci_ev->data + sizeof(struct ble_hci_ev_command_complete);
+
+  char fmt_buf[16];
+  char msg[] = "sdc_cmd ";
+  for (size_t i = 0; i < sizeof(msg) - 1; ++i) {
+    uart_write_byte(DBG_UART, msg[i]);
+  }
+
+  itoa(ogf, fmt_buf, 16);
+  uart_write_byte(DBG_UART, fmt_buf[8]);
+  uart_write_byte(DBG_UART, fmt_buf[9]);
+  uart_write_byte(DBG_UART, ' ');
+
+  itoa(ocf, fmt_buf, 16);
+  uart_write_byte(DBG_UART, fmt_buf[8]);
+  uart_write_byte(DBG_UART, fmt_buf[9]);
+  uart_write_byte(DBG_UART, ' ');
+
+  uart_write_byte(DBG_UART, '\n');
 
   switch (ogf) {
     case 0x01:
