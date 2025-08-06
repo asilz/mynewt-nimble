@@ -796,7 +796,7 @@ ble_hs_init(void)
      * queue ensures the event won't run until the end of main().  This allows
      * the application to configure this package in the meantime.
      */
-#if MYNEWT_VAL(BLE_HS_AUTO_START)
+#if MYNEWT_VAL(BLE_HS_AUTO_START) && 0
 #ifdef MYNEWT
     ble_npl_eventq_put((struct ble_npl_eventq *)os_eventq_dflt_get(),
                        &ble_hs_ev_start_stage1);
