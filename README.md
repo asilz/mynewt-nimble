@@ -22,6 +22,9 @@
   
 <img src="http://mynewt.apache.org/img/logo.svg" width="250" alt="Apache Mynewt">
 
+## SoftDevice Controller
+This fork adds [SoftDevice Controller](https://github.com/nrfconnect/sdk-nrfxlib/tree/main/softdevice_controller) with an HCI. They are placed [here](https://github.com/asilz/mynewt-nimble/tree/master/nimble/transport/sdc). 
+
 
 ## Overview
 
